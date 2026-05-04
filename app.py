@@ -13,7 +13,7 @@ from summarizer.utils import (
     save_summary,
     format_score_bar
 )
-from summarizer.summarizer import generate_summary, SENTENCE_RELEVANCE_THRESHOLD
+from summarizer.summarizer import generate_summary
 
 # ─── Page Configuration ───────────────────────────────────────────────────────
 st.set_page_config(
