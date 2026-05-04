@@ -10,81 +10,165 @@ from summarizer.preprocessor import (
     preprocess_for_tfidf,
 )
 
+# ─── Thresholds ───────────────────────────────────────────────────────────────
 
-def score_sentences_by_prompt(
-    sentences: list,
+# Minimum cosine score a sentence must have to be included
+SENTENCE_RELEVANCE_THRESHOLD = 0.08
+
+# If the AVERAGE of top-5 scores is below this,
+# the prompt is considered unrelated to the document
+DOCUMENT_RELEVANCE_THRESHOLD = 0.06
+
+# Minimum number of sentences that must pass threshold
+# before we consider the summary valid
+MIN_VALID_SENTENCES = 2
+
+
+def check_prompt_document_relevance(
     prompt: str,
-    top_n: int = 10
-) -> list:
+    sentences: list,
+    threshold: float = DOCUMENT_RELEVANCE_THRESHOLD
+) -> tuple:
     """
-    Score each sentence by TF-IDF cosine similarity with the prompt.
-    Returns top_n most relevant sentences in original document order.
+    Before summarizing, check whether the prompt is
+    meaningfully related to the document content at all.
+
+    Returns:
+        (is_relevant: bool, top_avg_score: float, reason: str)
     """
-    if not sentences:
-        return []
+    if not sentences or not prompt.strip():
+        return False, 0.0, "Empty document or prompt."
 
-    if not prompt.strip():
-        return []
-
-    # Preprocess prompt
-    processed_prompt = preprocess_for_tfidf(prompt)
-
-    # Preprocess all sentences
+    processed_prompt    = preprocess_for_tfidf(prompt)
     processed_sentences = [preprocess_for_tfidf(s) for s in sentences]
 
-    # Safety check — if preprocessing emptied everything, fallback to raw
+    # Safety: if preprocessing kills the prompt, use raw
     if not processed_prompt.strip():
         processed_prompt = prompt.lower().strip()
 
-    processed_sentences = [
-        ps if ps.strip() else sentences[i].lower()
-        for i, ps in enumerate(processed_sentences)
+    # Filter out empty processed sentences
+    valid_pairs = [
+        (orig, proc)
+        for orig, proc in zip(sentences, processed_sentences)
+        if proc.strip()
     ]
 
-    # Build corpus: prompt first, then all sentences
-    corpus = [processed_prompt] + processed_sentences
+    if not valid_pairs:
+        return False, 0.0, "All sentences became empty after preprocessing."
 
-    # TF-IDF Vectorization
+    orig_sentences, proc_sentences = zip(*valid_pairs)
+
+    corpus = [processed_prompt] + list(proc_sentences)
+
     try:
         vectorizer = TfidfVectorizer(
             max_features=10000,
             ngram_range=(1, 2),
             sublinear_tf=True,
-            min_df=1,           # Accept terms appearing even once
-            max_df=1.0          # No upper frequency cutoff
+            min_df=1,
+            max_df=1.0
         )
         tfidf_matrix = vectorizer.fit_transform(corpus)
     except ValueError:
-        # If vectorizer fails (empty vocabulary), return first top_n sentences
-        return [
-            (i, sentences[i], 0.0)
-            for i in range(min(top_n, len(sentences)))
-        ]
+        return False, 0.0, "TF-IDF vectorization failed — vocabulary may be empty."
 
-    # Prompt vector = row 0; sentence vectors = rows 1 onwards
     prompt_vector    = tfidf_matrix[0]
     sentence_vectors = tfidf_matrix[1:]
 
-    # Compute cosine similarities
     scores = cosine_similarity(prompt_vector, sentence_vectors).flatten()
 
-    # --- Fallback: if ALL scores are zero, use sentence length ranking ---
-    if scores.max() == 0:
-        # Rank by sentence length (longer = more content-rich)
-        scores = np.array([len(s.split()) for s in sentences], dtype=float)
-        scores = scores / scores.max()  # Normalize to 0-1
+    # Take average of top-5 scores as document relevance indicator
+    top_k       = min(5, len(scores))
+    top_scores  = np.sort(scores)[::-1][:top_k]
+    avg_top     = float(np.mean(top_scores))
+    max_score   = float(np.max(scores))
 
-    # Pick top_n indices
-    top_n = min(top_n, len(sentences))
-    top_indices = np.argsort(scores)[::-1][:top_n]
+    if avg_top < threshold:
+        reason = (
+            f"Low relevance detected. "
+            f"Best match score: `{max_score:.4f}` | "
+            f"Top-{top_k} average: `{avg_top:.4f}` | "
+            f"Threshold: `{threshold}`"
+        )
+        return False, avg_top, reason
 
-    # Re-sort to preserve original document order
-    top_indices_ordered = sorted(top_indices)
+    return True, avg_top, f"Relevant. Top-{top_k} avg score: `{avg_top:.4f}`"
 
-    return [
-        (int(idx), sentences[idx], round(float(scores[idx]), 4))
-        for idx in top_indices_ordered
+
+def score_sentences_by_prompt(
+    sentences: list,
+    prompt: str,
+    top_n: int = 10,
+    threshold: float = SENTENCE_RELEVANCE_THRESHOLD
+) -> tuple:
+    """
+    Score each sentence by TF-IDF cosine similarity with prompt.
+    Only keeps sentences that EXCEED the relevance threshold.
+
+    Returns:
+        (scored_sentences, all_scores, vectorizer_vocab_size)
+        scored_sentences: list of (original_index, sentence, score)
+    """
+    if not sentences or not prompt.strip():
+        return [], [], 0
+
+    processed_prompt    = preprocess_for_tfidf(prompt)
+    processed_sentences = [preprocess_for_tfidf(s) for s in sentences]
+
+    # Fallback: if prompt preprocessing empties it
+    if not processed_prompt.strip():
+        processed_prompt = prompt.lower().strip()
+
+    # Filter empty processed sentences — keep originals paired
+    valid_pairs = []
+    for i, (orig, proc) in enumerate(zip(sentences, processed_sentences)):
+        if proc.strip():
+            valid_pairs.append((i, orig, proc))
+
+    if not valid_pairs:
+        return [], [], 0
+
+    indices, orig_sents, proc_sents = zip(*valid_pairs)
+
+    corpus = [processed_prompt] + list(proc_sents)
+
+    try:
+        vectorizer = TfidfVectorizer(
+            max_features=10000,
+            ngram_range=(1, 2),
+            sublinear_tf=True,
+            min_df=1,
+            max_df=1.0
+        )
+        tfidf_matrix  = vectorizer.fit_transform(corpus)
+        vocab_size    = len(vectorizer.vocabulary_)
+    except ValueError:
+        return [], [], 0
+
+    prompt_vector    = tfidf_matrix[0]
+    sentence_vectors = tfidf_matrix[1:]
+
+    scores = cosine_similarity(prompt_vector, sentence_vectors).flatten()
+
+    # ── Apply Threshold Filter ────────────────────────────────────────────────
+    # Only keep sentences whose score is above threshold
+    threshold_filtered = [
+        (int(indices[i]), orig_sents[i], round(float(scores[i]), 4))
+        for i in range(len(scores))
+        if scores[i] >= threshold
     ]
+
+    if not threshold_filtered:
+        return [], list(scores), vocab_size
+
+    # Sort by score descending, pick top_n
+    threshold_filtered.sort(key=lambda x: x[2], reverse=True)
+    top_results = threshold_filtered[:top_n]
+
+    # Re-sort by original document order
+    top_results.sort(key=lambda x: x[0])
+
+    return top_results, list(scores), vocab_size
 
 
 def generate_summary(
@@ -93,52 +177,99 @@ def generate_summary(
     top_n: int = 10,
 ) -> dict:
     """
-    Full pipeline:
-    1. Clean text
-    2. Tokenize into sentences
-    3. Score by prompt relevance
-    4. Return structured result
+    Full NLP summarization pipeline with relevance gating.
+
+    Returns a structured dict with:
+    - summary text (or None if not relevant)
+    - sentence count
+    - top sentences with scores
+    - relevance info
+    - debug stats
+    - status: "success" | "low_relevance" | "no_sentences" | "error"
     """
 
     # Step 1: Clean
-    cleaned = clean_text(combined_text)
+    cleaned   = clean_text(combined_text)
 
     # Step 2: Tokenize
     sentences = sentence_tokenize(cleaned)
 
-    # --- Debug info stored in result ---
     debug_info = {
         "total_chars"    : len(cleaned),
         "total_sentences": len(sentences),
+        "prompt_length"  : len(prompt),
     }
 
+    # ── Guard: No sentences ───────────────────────────────────────────────────
     if len(sentences) == 0:
         return {
-            "summary"        : "⚠️ No meaningful sentences found in documents.",
+            "status"         : "no_sentences",
+            "summary"        : None,
             "sentence_count" : 0,
             "top_sentences"  : [],
+            "relevance_score": 0.0,
+            "relevance_msg"  : "No sentences could be extracted from documents.",
             "debug"          : debug_info,
         }
 
-    # Cap top_n
-    top_n = min(top_n, len(sentences))
+    # Step 3: Relevance Gate
+    # Check if prompt is even related to the document BEFORE scoring
+    is_relevant, rel_score, rel_msg = check_prompt_document_relevance(
+        prompt, sentences
+    )
 
-    # Step 3: Score
-    scored = score_sentences_by_prompt(sentences, prompt, top_n=top_n)
+    debug_info["relevance_score"] = rel_score
+    debug_info["relevance_msg"]   = rel_msg
 
-    if not scored:
-        # Last resort fallback — just return first top_n sentences
-        scored = [
-            (i, sentences[i], 0.0)
-            for i in range(min(top_n, len(sentences)))
-        ]
+    # ── Guard: Prompt not related to document ─────────────────────────────────
+    if not is_relevant:
+        return {
+            "status"         : "low_relevance",
+            "summary"        : None,
+            "sentence_count" : 0,
+            "top_sentences"  : [],
+            "relevance_score": rel_score,
+            "relevance_msg"  : rel_msg,
+            "debug"          : debug_info,
+        }
 
-    # Step 4: Build summary
+    # Step 4: Score sentences with threshold
+    top_n  = min(top_n, len(sentences))
+    scored, all_scores, vocab_size = score_sentences_by_prompt(
+        sentences, prompt, top_n=top_n,
+        threshold=SENTENCE_RELEVANCE_THRESHOLD
+    )
+
+    debug_info["vocab_size"]  = vocab_size
+    debug_info["all_scores_max"]  = round(float(max(all_scores)), 4) if all_scores else 0
+    debug_info["all_scores_mean"] = round(float(np.mean(all_scores)), 4) if all_scores else 0
+    debug_info["sentences_above_threshold"] = len(scored)
+
+    # ── Guard: Not enough sentences passed threshold ──────────────────────────
+    if len(scored) < MIN_VALID_SENTENCES:
+        return {
+            "status"         : "low_relevance",
+            "summary"        : None,
+            "sentence_count" : len(scored),
+            "top_sentences"  : scored,
+            "relevance_score": rel_score,
+            "relevance_msg"  : (
+                f"Only `{len(scored)}` sentence(s) matched the prompt "
+                f"above the threshold of `{SENTENCE_RELEVANCE_THRESHOLD}`. "
+                f"Try a more relevant prompt."
+            ),
+            "debug"          : debug_info,
+        }
+
+    # Step 5: Build summary
     summary_text = " ".join([item[1] for item in scored])
 
     return {
+        "status"         : "success",
         "summary"        : summary_text,
         "sentence_count" : len(scored),
         "top_sentences"  : scored,
+        "relevance_score": rel_score,
+        "relevance_msg"  : rel_msg,
         "debug"          : debug_info,
     }
