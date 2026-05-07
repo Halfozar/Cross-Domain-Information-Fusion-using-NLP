@@ -10,7 +10,7 @@ from summarizer.preprocessor import (
     preprocess_for_tfidf,
 )
 
-# ─── Thresholds ───────────────────────────────────────────────────────────────
+# ─── Default Thresholds ──────────────────────────────────────────────────────
 
 # Minimum cosine score a sentence must have to be included
 SENTENCE_RELEVANCE_THRESHOLD = 0.08
@@ -175,9 +175,18 @@ def generate_summary(
     combined_text: str,
     prompt: str,
     top_n: int = 10,
+    doc_threshold: float = DOCUMENT_RELEVANCE_THRESHOLD,
+    sent_threshold: float = SENTENCE_RELEVANCE_THRESHOLD,
 ) -> dict:
     """
     Full NLP summarization pipeline with relevance gating.
+
+    Args:
+        combined_text: Raw text from all uploaded documents
+        prompt: User's summarization prompt/query
+        top_n: Maximum number of sentences to return
+        doc_threshold: Minimum relevance score for prompt to match document
+        sent_threshold: Minimum relevance score for individual sentences
 
     Returns a structured dict with:
     - summary text (or None if not relevant)
@@ -198,6 +207,8 @@ def generate_summary(
         "total_chars"    : len(cleaned),
         "total_sentences": len(sentences),
         "prompt_length"  : len(prompt),
+        "doc_threshold"  : doc_threshold,
+        "sent_threshold" : sent_threshold,
     }
 
     # ── Guard: No sentences ───────────────────────────────────────────────────
@@ -215,7 +226,7 @@ def generate_summary(
     # Step 3: Relevance Gate
     # Check if prompt is even related to the document BEFORE scoring
     is_relevant, rel_score, rel_msg = check_prompt_document_relevance(
-        prompt, sentences
+        prompt, sentences, threshold=doc_threshold
     )
 
     debug_info["relevance_score"] = rel_score
@@ -234,10 +245,10 @@ def generate_summary(
         }
 
     # Step 4: Score sentences with threshold
-    top_n  = min(top_n, len(sentences))
+    top_n_adjusted = min(top_n, len(sentences))
     scored, all_scores, vocab_size = score_sentences_by_prompt(
-        sentences, prompt, top_n=top_n,
-        threshold=SENTENCE_RELEVANCE_THRESHOLD
+        sentences, prompt, top_n=top_n_adjusted,
+        threshold=sent_threshold
     )
 
     debug_info["vocab_size"]  = vocab_size
@@ -255,8 +266,8 @@ def generate_summary(
             "relevance_score": rel_score,
             "relevance_msg"  : (
                 f"Only `{len(scored)}` sentence(s) matched the prompt "
-                f"above the threshold of `{SENTENCE_RELEVANCE_THRESHOLD}`. "
-                f"Try a more relevant prompt."
+                f"above the threshold of `{sent_threshold}`. "
+                f"Try lowering the threshold or using a more relevant prompt."
             ),
             "debug"          : debug_info,
         }
